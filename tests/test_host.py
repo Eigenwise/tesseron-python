@@ -603,6 +603,103 @@ async def test_replacing_a_subscribed_resource_stops_its_subscriptions(remove: b
     assert stopped == ["cart", "cart"]
 
 
+async def test_removing_a_resource_continues_after_a_subscription_cleanup_raises() -> None:
+    app = application()
+    welcomed = welcome_event(app)
+    cleanup_calls: list[int] = []
+    subscription_count = 0
+
+    async def read_cart() -> JsonValue:
+        return {}
+
+    def subscribe(emit: Emit) -> Unsubscribe:
+        nonlocal subscription_count
+        subscription_count += 1
+        cleanup_number = subscription_count
+
+        def cleanup() -> None:
+            cleanup_calls.append(cleanup_number)
+            if cleanup_number == 1:
+                raise RuntimeError("cleanup failed")
+
+        return cleanup
+
+    cart = app.resource("cart", read=read_cart, subscribe=subscribe)
+    async with listening(app) as host, dial(host) as gateway:
+        await gateway.accept_handshake()
+        await asyncio.wait_for(welcomed.wait(), 1)
+        for subscription_id in ["cart-1", "cart-2"]:
+            await gateway.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": subscription_id,
+                    "method": "resources/subscribe",
+                    "params": {"name": "cart", "subscriptionId": subscription_id},
+                }
+            )
+            assert (await gateway.receive())["result"] is None
+
+        assert host.remove_resource("cart") is True
+        assert await gateway.receive() == {
+            "jsonrpc": "2.0",
+            "method": "resources/list_changed",
+            "params": {"resources": []},
+        }
+        assert cleanup_calls == [1, 2]
+        await cart.publish("after")
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.receive(), 0.1)
+
+
+async def test_disconnect_continues_after_a_subscription_cleanup_raises() -> None:
+    app = application()
+    welcomed = welcome_event(app)
+    disconnected = asyncio.Event()
+    app.add_event_listener(
+        lambda event: disconnected.set() if isinstance(event, DisconnectedEvent) else None
+    )
+
+    async def read_cart() -> JsonValue:
+        return {}
+
+    def subscribe(emit: Emit) -> Unsubscribe:
+        def cleanup() -> None:
+            raise RuntimeError("cleanup failed")
+
+        return cleanup
+
+    app.resource("cart", read=read_cart, subscribe=subscribe)
+    async with listening(app) as host:
+        async with dial(host) as gateway:
+            await gateway.accept_handshake()
+            await asyncio.wait_for(welcomed.wait(), 1)
+            await gateway.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "cart-1",
+                    "method": "resources/subscribe",
+                    "params": {"name": "cart", "subscriptionId": "cart-1"},
+                }
+            )
+            assert (await gateway.receive())["result"] is None
+
+        await asyncio.wait_for(disconnected.wait(), 1)
+        assert host._shared._session is None
+
+        async def read_stock() -> JsonValue:
+            return {}
+
+        host.resource("stock", read=read_stock)
+        host._shared.forget_resume_credentials()
+        async with dial(host) as gateway:
+            hello = await gateway.receive()
+            assert hello["method"] == "tesseron/hello"
+            assert entries(members(hello, "params"), "resources") == [
+                {"name": "cart", "description": "", "subscribable": True},
+                {"name": "stock", "description": "", "subscribable": False},
+            ]
+
+
 async def test_removing_an_action_notifies_once_and_stops_new_invocations() -> None:
     app = todo_application()
     welcomed = welcome_event(app)

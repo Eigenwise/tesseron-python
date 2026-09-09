@@ -449,7 +449,10 @@ class Session:
         for subscription_id, (name, subscription) in list(self._subscriptions.items()):
             if resource_name is None or name == resource_name:
                 del self._subscriptions[subscription_id]
-                subscription.stop()
+                try:
+                    subscription.stop()
+                except Exception:
+                    logger.exception("tesseron: subscription cleanup for %r raised", name)
 
     # Handshake.
 
