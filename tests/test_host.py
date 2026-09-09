@@ -22,12 +22,19 @@ from conftest import (
 )
 from tesseron import (
     ActionContext,
+    DisconnectedEvent,
     DuplicateNameError,
+    Emit,
+    HandshakeFailedEvent,
     HostError,
+    HostEvent,
     InvalidApplicationIdError,
+    JsonObject,
     JsonValue,
     ManifestPublication,
     TesseronApp,
+    Unsubscribe,
+    WelcomeEvent,
 )
 
 
@@ -413,3 +420,315 @@ def test_a_handler_that_does_not_take_input_and_context_is_refused() -> None:
 
     with pytest.raises(HostError, match="input, context"):
         app.action("addTodo")(only_input)
+
+
+def welcome_event(app: TesseronApp) -> asyncio.Event:
+    welcomed = asyncio.Event()
+    app.add_event_listener(
+        lambda event: welcomed.set() if isinstance(event, WelcomeEvent) else None
+    )
+    return welcomed
+
+
+async def test_registering_an_action_after_welcome_pushes_the_full_action_manifest() -> None:
+    app = todo_application()
+    welcomed = welcome_event(app)
+    async with listening(app) as host, dial(host) as gateway:
+        hello = await gateway.accept_handshake()
+        await asyncio.wait_for(welcomed.wait(), 1)
+
+        @host.action(
+            "echo", description="Echo input", output_schema={"type": "object"}, timeout_ms=500
+        )
+        async def echo(parsed: AddTodo, context: ActionContext) -> JsonValue:
+            return {"text": parsed.text}
+
+        notification = await gateway.receive()
+        expected_notification: JsonObject = {
+            "jsonrpc": "2.0",
+            "method": "actions/list_changed",
+            "params": {
+                "actions": [
+                    *entries(members(hello, "params"), "actions"),
+                    {
+                        "name": "echo",
+                        "description": "Echo input",
+                        "inputSchema": AddTodo.model_json_schema(mode="validation"),
+                        "outputSchema": {"type": "object"},
+                        "timeoutMs": 500,
+                    },
+                ]
+            },
+        }
+        assert notification == expected_notification
+        await gateway.invoke("echo", request_id="echo-1", input_value={"text": "new"})
+        assert members(await gateway.receive(), "result")["output"] == {"text": "new"}
+        await gateway.invoke("echo", request_id="echo-2", input_value={"text": ""})
+        assert members(await gateway.receive(), "error")["code"] == -32004
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.receive(), 0.1)
+
+
+async def test_removing_a_resource_after_welcome_notifies_and_unknown_names_are_silent() -> None:
+    app = todo_application()
+    welcomed = welcome_event(app)
+    async with listening(app) as host, dial(host) as gateway:
+        await gateway.accept_handshake()
+        await asyncio.wait_for(welcomed.wait(), 1)
+        assert host.remove_resource("cart") is True
+        assert await gateway.receive() == {
+            "jsonrpc": "2.0",
+            "method": "resources/list_changed",
+            "params": {"resources": []},
+        }
+        assert host.remove_resource("unknown") is False
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.receive(), 0.1)
+
+
+async def test_registrations_before_welcome_are_carried_by_hello_and_send_nothing() -> None:
+    app = application()
+    welcomed = welcome_event(app)
+    async with listening(app) as host:
+
+        @host.action("echo")
+        async def echo(raw_input: JsonValue, context: ActionContext) -> JsonValue:
+            return raw_input
+
+        async def read_cart() -> JsonValue:
+            return {}
+
+        host.resource("cart", read=read_cart)
+        async with dial(host) as gateway:
+            hello = await gateway.accept_handshake()
+            assert hello["method"] == "tesseron/hello"
+            assert entries(members(hello, "params"), "actions") == [
+                {"name": "echo", "description": "", "inputSchema": {}}
+            ]
+            assert entries(members(hello, "params"), "resources") == [
+                {"name": "cart", "description": "", "subscribable": False}
+            ]
+            await asyncio.wait_for(welcomed.wait(), 1)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(gateway.receive(), 0.1)
+
+
+async def test_replacing_an_action_swaps_its_handler_and_keeps_its_position() -> None:
+    app = todo_application()
+    welcomed = welcome_event(app)
+    async with listening(app) as host, dial(host) as gateway:
+        hello = await gateway.accept_handshake()
+        await asyncio.wait_for(welcomed.wait(), 1)
+
+        @host.action("addTodo", description="First replacement")
+        async def first(raw_input: JsonValue, context: ActionContext) -> JsonValue:
+            return "first"
+
+        first_manifest = entries(members(await gateway.receive(), "params"), "actions")
+        assert first_manifest[0] == {
+            "name": "addTodo",
+            "description": "First replacement",
+            "inputSchema": {},
+        }
+
+        @host.action("addTodo", description="Second replacement")
+        async def second(raw_input: JsonValue, context: ActionContext) -> JsonValue:
+            return "second"
+
+        notification = await gateway.receive()
+        assert notification["method"] == "actions/list_changed"
+        assert entries(members(notification, "params"), "actions") == [
+            {"name": "addTodo", "description": "Second replacement", "inputSchema": {}},
+            entries(members(hello, "params"), "actions")[1],
+        ]
+        await gateway.invoke("addTodo", request_id="replacement", input_value={})
+        assert members(await gateway.receive(), "result")["output"] == "second"
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.receive(), 0.1)
+
+
+@pytest.mark.parametrize("remove", [False, True])
+async def test_replacing_a_subscribed_resource_stops_its_subscriptions(remove: bool) -> None:
+    app = application()
+    welcomed = welcome_event(app)
+    stopped: list[str] = []
+
+    async def read_cart() -> JsonValue:
+        return {}
+
+    def subscribe(emit: Emit) -> Unsubscribe:
+        return lambda: stopped.append("cart")
+
+    cart = app.resource("cart", read=read_cart, subscribe=subscribe)
+    other = app.resource("other", read=read_cart, subscribable=True)
+    async with listening(app) as host, dial(host) as gateway:
+        await gateway.accept_handshake()
+        await asyncio.wait_for(welcomed.wait(), 1)
+        for subscription_id, name in [("cart-1", "cart"), ("other-1", "other"), ("cart-2", "cart")]:
+            await gateway.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": subscription_id,
+                    "method": "resources/subscribe",
+                    "params": {"name": name, "subscriptionId": subscription_id},
+                }
+            )
+            assert (await gateway.receive())["result"] is None
+        await cart.publish("before")
+        assert members(await gateway.receive(), "params")["subscriptionId"] == "cart-1"
+        assert members(await gateway.receive(), "params")["subscriptionId"] == "cart-2"
+
+        if remove:
+            assert host.remove_resource("cart") is True
+        else:
+            replacement = host.resource(
+                "cart", read=read_cart, description="New", subscribable=True
+            )
+            await replacement.publish("not subscribed yet")
+        notification = await gateway.receive()
+        assert notification["method"] == "resources/list_changed"
+        resources: list[JsonValue] = [{"name": "other", "description": "", "subscribable": True}]
+        if not remove:
+            resources.insert(0, {"name": "cart", "description": "New", "subscribable": True})
+        assert members(notification, "params") == {"resources": resources}
+        assert stopped == ["cart", "cart"]
+        await cart.publish("after")
+        await other.publish("still subscribed")
+        assert members(await gateway.receive(), "params") == {
+            "subscriptionId": "other-1",
+            "value": "still subscribed",
+        }
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.receive(), 0.1)
+    assert stopped == ["cart", "cart"]
+
+
+async def test_removing_an_action_notifies_once_and_stops_new_invocations() -> None:
+    app = todo_application()
+    welcomed = welcome_event(app)
+    async with listening(app) as host, dial(host) as gateway:
+        hello = await gateway.accept_handshake()
+        await asyncio.wait_for(welcomed.wait(), 1)
+        assert host.remove_action("addTodo") is True
+        assert await gateway.receive() == {
+            "jsonrpc": "2.0",
+            "method": "actions/list_changed",
+            "params": {"actions": entries(members(hello, "params"), "actions")[1:]},
+        }
+        assert host.remove_action("unknown") is False
+        await gateway.invoke("addTodo", request_id="removed", input_value={})
+        assert members(await gateway.receive(), "error")["code"] == -32003
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.receive(), 0.1)
+
+
+@pytest.mark.parametrize("refuse_resume", [False, True])
+async def test_disconnected_mutations_resume_silently_until_an_accepted_welcome(
+    refuse_resume: bool,
+) -> None:
+    app = todo_application()
+    welcomed = welcome_event(app)
+    disconnected = asyncio.Event()
+    app.add_event_listener(
+        lambda event: disconnected.set() if isinstance(event, DisconnectedEvent) else None
+    )
+    async with listening(app) as host:
+        async with dial(host) as gateway:
+            await gateway.accept_handshake()
+            await asyncio.wait_for(welcomed.wait(), 1)
+        await asyncio.wait_for(disconnected.wait(), 1)
+        welcomed.clear()
+        assert host.remove_action("wait") is True
+        async with dial(host) as gateway:
+            resume = await gateway.receive()
+            assert resume["method"] == "tesseron/resume"
+            actions = entries(members(resume, "params"), "actions")
+            assert len(actions) == 1
+            assert isinstance(actions[0], dict) and actions[0]["name"] == "addTodo"
+            assert host.remove_resource("cart") is True
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(gateway.receive(), 0.1)
+            handshake = resume
+            if refuse_resume:
+                await gateway.refuse(resume, -32011, "Resume failed")
+                handshake = await gateway.receive()
+                assert handshake["method"] == "tesseron/hello"
+                assert members(handshake, "params")["resources"] == []
+            await gateway.answer(
+                handshake,
+                {
+                    "sessionId": SESSION_ID,
+                    "protocolVersion": "1.2.0",
+                    "capabilities": ALL_CAPABILITIES,
+                    "agent": {"id": "agent_test", "name": "test-runner"},
+                    "resumeToken": "next-token",
+                },
+            )
+            await asyncio.wait_for(welcomed.wait(), 1)
+            assert host.remove_action("addTodo") is True
+            assert await gateway.receive() == {
+                "jsonrpc": "2.0",
+                "method": "actions/list_changed",
+                "params": {"actions": []},
+            }
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(gateway.receive(), 0.1)
+
+
+async def test_a_rejected_resume_never_attaches_a_session_for_mutations() -> None:
+    app = todo_application()
+    welcomed = welcome_event(app)
+    refused = asyncio.Event()
+    async with listening(app) as host:
+
+        def on_event(event: HostEvent) -> None:
+            if isinstance(event, HandshakeFailedEvent):
+                assert host.remove_action("addTodo") is True
+                refused.set()
+
+        app.add_event_listener(on_event)
+        async with dial(host) as gateway:
+            await gateway.accept_handshake()
+            await asyncio.wait_for(welcomed.wait(), 1)
+        async with dial(host) as gateway:
+            resume = await gateway.receive()
+            assert resume["method"] == "tesseron/resume"
+            await gateway.refuse(resume, -32000, "Protocol mismatch")
+            await asyncio.wait_for(refused.wait(), 1)
+            with pytest.raises(ConnectionClosed):
+                await gateway.receive()
+
+
+async def test_registering_a_resource_after_welcome_appends_the_full_manifest() -> None:
+    app = todo_application()
+    welcomed = welcome_event(app)
+    async with listening(app) as host, dial(host) as gateway:
+        hello = await gateway.accept_handshake()
+        await asyncio.wait_for(welcomed.wait(), 1)
+
+        async def read_stock() -> JsonValue:
+            return {"remaining": 3}
+
+        host.resource("stock", read=read_stock, description="Stock")
+        expected_notification: JsonObject = {
+            "jsonrpc": "2.0",
+            "method": "resources/list_changed",
+            "params": {
+                "resources": [
+                    *entries(members(hello, "params"), "resources"),
+                    {"name": "stock", "description": "Stock", "subscribable": False},
+                ]
+            },
+        }
+        assert await gateway.receive() == expected_notification
+        await gateway.send(
+            {
+                "jsonrpc": "2.0",
+                "id": "read-stock",
+                "method": "resources/read",
+                "params": {"name": "stock"},
+            }
+        )
+        assert members(await gateway.receive(), "result")["value"] == {"remaining": 3}
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.receive(), 0.1)

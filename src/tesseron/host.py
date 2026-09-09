@@ -47,13 +47,14 @@ from .protocol import (
     Capabilities,
     ClaimedParams,
     HelloParams,
+    Methods,
     ResourceDescriptor,
     ResumeParams,
     WelcomeResult,
     is_valid_application_id,
 )
 from .resource import Resource, ResourceReader, SubscribeCallback
-from .session import serve_connection
+from .session import Session, serve_connection
 
 __all__ = [
     "ClaimedEvent",
@@ -120,6 +121,7 @@ class SharedHost:
         self.actions = actions
         self.resources = resources
         self._listeners = listeners
+        self._session: Session | None = None
         self._welcome: WelcomeResult | None = None
         self._claim: ClaimedParams | None = None
         self._resume: tuple[str, str] | None = None
@@ -164,8 +166,9 @@ class SharedHost:
         """Drops stale credentials so the next handshake opens a fresh session."""
         self._resume = None
 
-    def record_welcome(self, welcome: WelcomeResult) -> None:
-        """Stores the welcome and rotates the resume token it carried."""
+    def record_welcome(self, welcome: WelcomeResult, session: Session) -> None:
+        """Attaches the accepted session and rotates its token before notifying listeners."""
+        self._session = session
         self._welcome = welcome
         self._resume = (
             (welcome.session_id, welcome.resume_token) if welcome.resume_token is not None else None
@@ -190,11 +193,59 @@ class SharedHost:
 
     def emit_handshake_failed(self, error: ProtocolError) -> None:
         """Reports a handshake the gateway refused."""
+        self._session = None
         self._emit(HandshakeFailedEvent(error))
 
     def emit_disconnected(self) -> None:
         """Reports the gateway connection closing."""
+        self._session = None
         self._emit(DisconnectedEvent())
+
+    def register_action(self, action: RegisteredAction) -> None:
+        """Upserts an action synchronously on the event-loop thread."""
+        self.actions[action.descriptor.name] = action
+        self._notify_actions_changed()
+
+    def register_resource(self, resource: Resource) -> None:
+        """Upserts a resource on the event-loop thread, stopping its old subscriptions."""
+        if self._session is not None:
+            self._session.drop_subscriptions(resource.name)
+        self.resources[resource.name] = resource
+        self._notify_resources_changed()
+
+    def remove_action(self, name: str) -> bool:
+        """Removes an action synchronously on the event-loop thread, if present."""
+        if self.actions.pop(name, None) is None:
+            return False
+        self._notify_actions_changed()
+        return True
+
+    def remove_resource(self, name: str) -> bool:
+        """Removes a resource and its subscriptions synchronously on the event-loop thread."""
+        if self.resources.pop(name, None) is None:
+            return False
+        if self._session is not None:
+            self._session.drop_subscriptions(name)
+        self._notify_resources_changed()
+        return True
+
+    def _notify_actions_changed(self) -> None:
+        if self._welcome is not None and self._session is not None:
+            self._session.notify(
+                Methods.ACTIONS_LIST_CHANGED,
+                {"actions": [descriptor.to_wire() for descriptor in self._action_descriptors()]},
+            )
+
+    def _notify_resources_changed(self) -> None:
+        if self._welcome is not None and self._session is not None:
+            self._session.notify(
+                Methods.RESOURCES_LIST_CHANGED,
+                {
+                    "resources": [
+                        descriptor.to_wire() for descriptor in self._resource_descriptors()
+                    ]
+                },
+            )
 
     def _apply_claim(self, claimed: ClaimedParams) -> None:
         welcome = self._welcome
@@ -222,6 +273,38 @@ class SharedHost:
 
     def _resource_descriptors(self) -> list[ResourceDescriptor]:
         return [resource.descriptor for resource in self.resources.values()]
+
+
+def _build_action(
+    handler: LooseHandler,
+    *,
+    name: str,
+    description: str,
+    input_schema: JsonValue,
+    output_schema: JsonValue,
+    timeout_ms: int | None,
+    validate: InputValidator | None,
+) -> RegisteredAction:
+    handler_is_async = inspect.iscoroutinefunction(handler)
+    if not handler_is_async:
+        raise HostError(f"the handler for {name!r} must be an async function")
+    model = _input_model(handler)
+    if model is not None:
+        dispatch = typed_dispatch(model, handler)
+        schema = (
+            model.model_json_schema(mode="validation") if input_schema is None else input_schema
+        )
+    else:
+        dispatch = raw_dispatch(handler, validate)
+        schema = {} if input_schema is None else input_schema
+    descriptor = ActionDescriptor(
+        name=name,
+        description=description,
+        input_schema=schema,
+        output_schema=output_schema,
+        timeout_ms=timeout_ms,
+    )
+    return RegisteredAction(descriptor=descriptor, dispatch=dispatch)
 
 
 def _read_capabilities(payload: JsonValue) -> Capabilities | None:
@@ -286,32 +369,18 @@ class TesseronApp:
         """
 
         def register(handler: Handler) -> Handler:
-            # Held in a local so the type guard does not narrow the handler away from the
-            # type variable the decorator has to give back unchanged.
-            handler_is_async = inspect.iscoroutinefunction(handler)
-            if not handler_is_async:
-                raise HostError(f"the handler for {name!r} must be an async function")
-            model = _input_model(handler)
-            if model is not None:
-                dispatch = typed_dispatch(model, handler)
-                schema = (
-                    model.model_json_schema(mode="validation")
-                    if input_schema is None
-                    else input_schema
-                )
-            else:
-                dispatch = raw_dispatch(handler, validate)
-                schema = {} if input_schema is None else input_schema
-            descriptor = ActionDescriptor(
+            action = _build_action(
+                handler,
                 name=name,
                 description=description,
-                input_schema=schema,
+                input_schema=input_schema,
                 output_schema=output_schema,
                 timeout_ms=timeout_ms,
+                validate=validate,
             )
             if name in self._actions:
                 raise DuplicateNameError(f"action {name!r} was registered more than once")
-            self._actions[name] = RegisteredAction(descriptor=descriptor, dispatch=dispatch)
+            self._actions[name] = action
             return handler
 
         return register
@@ -404,6 +473,76 @@ class TesseronHost:
         self.instance_manifest_path = manifest_path
         self._server = server
         self._shared = shared
+
+    def action(
+        self,
+        name: str,
+        *,
+        description: str = "",
+        input_schema: JsonValue = None,
+        output_schema: JsonValue = None,
+        timeout_ms: int | None = None,
+        validate: InputValidator | None = None,
+    ) -> Callable[[Handler], Handler]:
+        """Upserts an action with the same input rules as :meth:`TesseronApp.action`.
+
+        Registration is synchronous and must run on the event-loop thread. A replacement
+        keeps its manifest position; a new name appends. Accepted sessions are notified.
+        """
+
+        def register(handler: Handler) -> Handler:
+            self._shared.register_action(
+                _build_action(
+                    handler,
+                    name=name,
+                    description=description,
+                    input_schema=input_schema,
+                    output_schema=output_schema,
+                    timeout_ms=timeout_ms,
+                    validate=validate,
+                )
+            )
+            return handler
+
+        return register
+
+    def resource(
+        self,
+        name: str,
+        *,
+        read: ResourceReader,
+        description: str = "",
+        subscribable: bool = False,
+        subscribe: SubscribeCallback | None = None,
+    ) -> Resource:
+        """Upserts a resource and returns its publishing handle.
+
+        Runs synchronously on the event-loop thread. Replacing keeps the manifest position
+        and stops the old subscriptions. Accepted sessions receive the updated manifest.
+        """
+        resource = Resource(
+            name,
+            read=read,
+            description=description,
+            subscribable=subscribable,
+            subscribe=subscribe,
+        )
+        self._shared.register_resource(resource)
+        return resource
+
+    def remove_action(self, name: str) -> bool:
+        """Removes an action on the event-loop thread; returns whether it existed.
+
+        This is synchronous. An unknown name sends no notification.
+        """
+        return self._shared.remove_action(name)
+
+    def remove_resource(self, name: str) -> bool:
+        """Removes a resource and its subscriptions on the event-loop thread.
+
+        This is synchronous. Returns whether it existed; an unknown name sends nothing.
+        """
+        return self._shared.remove_resource(name)
 
     @property
     def welcome(self) -> WelcomeResult | None:

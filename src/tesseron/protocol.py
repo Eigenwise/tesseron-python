@@ -49,6 +49,8 @@ class Methods:
     HELLO: Final = "tesseron/hello"
     RESUME: Final = "tesseron/resume"
     CLAIMED: Final = "tesseron/claimed"
+    ACTIONS_LIST_CHANGED: Final = "actions/list_changed"
+    RESOURCES_LIST_CHANGED: Final = "resources/list_changed"
     INVOKE: Final = "actions/invoke"
     CANCEL: Final = "actions/cancel"
     PROGRESS: Final = "actions/progress"

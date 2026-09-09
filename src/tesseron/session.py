@@ -55,7 +55,7 @@ class Session:
         self._pending: dict[RequestId, asyncio.Future[JsonValue]] = {}
         self._invocations: dict[str, Cancellation] = {}
         self._running: set[asyncio.Task[None]] = set()
-        self._subscriptions: dict[str, Subscription] = {}
+        self._subscriptions: dict[str, tuple[str, Subscription]] = {}
         self._next_request_id = 1
         self._handshake_settled = asyncio.Event()
 
@@ -71,7 +71,7 @@ class Session:
             await self._read_until_closed()
         finally:
             self._cancel_all_invocations()
-            self._drop_all_subscriptions()
+            self.drop_subscriptions()
             self._fail_all_pending()
             self.stop_sending()
             await asyncio.gather(handshake, writer, return_exceptions=True)
@@ -417,8 +417,8 @@ class Session:
 
         replaced = self._subscriptions.pop(subscription_id, None)
         if replaced is not None:
-            replaced.stop()
-        self._subscriptions[subscription_id] = resource.open_subscription(emit)
+            replaced[1].stop()
+        self._subscriptions[subscription_id] = (name, resource.open_subscription(emit))
 
     def _unsubscribe_from_resource(self, request_id: RequestId, params: JsonValue) -> None:
         """Drops a subscription.
@@ -437,18 +437,19 @@ class Session:
             return
         subscription = self._subscriptions.pop(subscription_id, None)
         if subscription is not None:
-            subscription.stop()
+            subscription[1].stop()
         self._send_envelope(jsonrpc.success(request_id, None))
 
-    def _drop_all_subscriptions(self) -> None:
-        """Tears down every subscription.
+    def drop_subscriptions(self, resource_name: str | None = None) -> None:
+        """Stops one resource's subscriptions, or all of them when the connection ends.
 
-        The agent that registered them is gone, and a subscriber still holding a listener
-        would emit into a closed socket for as long as the application runs.
+        Runs synchronously on the event-loop thread so a replaced resource cannot keep
+        publishing updates through its old subscriptions.
         """
-        for subscription in list(self._subscriptions.values()):
-            subscription.stop()
-        self._subscriptions.clear()
+        for subscription_id, (name, subscription) in list(self._subscriptions.items()):
+            if resource_name is None or name == resource_name:
+                del self._subscriptions[subscription_id]
+                subscription.stop()
 
     # Handshake.
 
@@ -509,7 +510,7 @@ class Session:
                 )
             )
             return
-        self._host.record_welcome(welcome)
+        self._host.record_welcome(welcome, self)
 
     def _reject_handshake(self, refusal: ProtocolError) -> None:
         """Ends the connection after a handshake the gateway refused.
